@@ -91,20 +91,19 @@ class PartsDrBrowser:
                 "--no-sandbox",
             ],
         )
+        # Usamos un contexto con un User Agent específico
         context = self._browser.new_context(
-            user_agent=USER_AGENT,
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
             viewport={"width": 1366, "height": 900},
         )
         self.page = context.new_page()
         
-        # Aquí es donde aplicas el stealth que instalamos
-        from playwright_stealth import stealth
+        # Aplicamos stealth correctamente usando la función importada al inicio
         stealth(self.page)
         
         self.page.set_default_timeout(self.timeout_ms)
         return self
 
-    # ASEGÚRATE DE QUE ESTO ESTÉ PRESENTE Y BIEN IDENTADO
     def __exit__(self, exc_type, exc, tb) -> None:
         try:
             if self._browser:
@@ -115,11 +114,19 @@ class PartsDrBrowser:
 
     def goto(self, url: str) -> str:
         assert self.page is not None
-        # Espera un poco para parecer humano
-        time.sleep(1)
+        # Pausa para no parecer un bot veloz
+        time.sleep(2)
+        
+        # Navegamos
         self.page.goto(url, wait_until="domcontentloaded")
+        
+        # Si detectamos el bloqueo de Cloudflare, esperamos un poco más
+        if "Just a moment" in self.page.content():
+            print("[!] Cloudflare detectado, esperando resolución...", file=sys.stderr)
+            time.sleep(5)
+            
         try:
-            self.page.wait_for_load_state("networkidle", timeout=8_000)
+            self.page.wait_for_load_state("networkidle", timeout=10_000)
         except:
             pass
         return self.page.content()
@@ -127,7 +134,6 @@ class PartsDrBrowser:
     def screenshot(self, path: str) -> None:
         assert self.page is not None
         self.page.screenshot(path=path, full_page=True)
-
 # --------------------------- URL Resolution ------------------------------- #
 
 def resolve_part_url(browser: PartsDrBrowser, query: str) -> str:
