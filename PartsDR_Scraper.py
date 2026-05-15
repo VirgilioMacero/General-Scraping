@@ -11,8 +11,7 @@ from typing import Dict, List, Optional
 from urllib.parse import quote_plus
 
 # 1. IMPORTACIÓN CORREGIDA
-import playwright_stealth 
-
+from playwright_stealth import stealth as apply_stealth
 try:
     from bs4 import BeautifulSoup, Tag
 except ImportError:
@@ -54,7 +53,7 @@ class PartsDrBrowser:
         self.page = context.new_page()
         
         # 2. LLAMADA CORREGIDA (Módulo.Función)
-        playwright_stealth.stealth(self.page)
+        apply_stealth(self.page)
         
         self.page.set_default_timeout(self.timeout_ms)
         return self
