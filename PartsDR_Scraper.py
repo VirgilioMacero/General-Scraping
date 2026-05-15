@@ -17,7 +17,10 @@ Uso:
     python3 partsdr_replaces.py WPW10476828 --save-html debug.html
     python3 partsdr_replaces.py --file ruta/al/archivo.html         (parsea sin red)
 
-Dependencias:
+Dependencias (recomendado, pasa Cloudflare):
+    pip install curl_cffi beautifulsoup4
+
+Dependencias mínimas (fallback, puede fallar con 403):
     pip install requests beautifulsoup4
 """
 
@@ -27,17 +30,38 @@ import argparse
 import json
 import re
 import sys
-from typing import Optional
+from typing import Tuple
 from urllib.parse import urljoin
 
+# ---------------------------------------------------------------------------
+# Cliente HTTP: preferimos curl_cffi (imita TLS de Chrome → pasa Cloudflare)
+# y caemos a requests si no está instalado.
+# ---------------------------------------------------------------------------
+
+_HTTP_BACKEND: str
 try:
-    import requests
+    from curl_cffi import requests as _http  # type: ignore
+    _HTTP_BACKEND = "curl_cffi"
+except ImportError:
+    try:
+        import requests as _http  # type: ignore
+        _HTTP_BACKEND = "requests"
+    except ImportError:
+        print(
+            "Falta un cliente HTTP. Instala (recomendado para esquivar Cloudflare):\n"
+            "    pip install curl_cffi beautifulsoup4\n"
+            "o, como mínimo:\n"
+            "    pip install requests beautifulsoup4",
+            file=sys.stderr,
+        )
+        sys.exit(127)
+
+try:
     from bs4 import BeautifulSoup
-except ImportError as e:
+except ImportError:
     print(
-        "Falta una dependencia. Instala con:\n"
-        "    pip install requests beautifulsoup4\n"
-        f"(detalle: {e})",
+        "Falta beautifulsoup4. Instala con:\n"
+        "    pip install beautifulsoup4",
         file=sys.stderr,
     )
     sys.exit(127)
@@ -46,19 +70,30 @@ except ImportError as e:
 BASE_URL = "https://partsdr.com"
 SEARCH_URL = f"{BASE_URL}/search"
 
-# User-Agent realista. Como vas a correrlo desde una IP residencial, basta
-# con un UA estándar de navegador.
+# Headers de Chrome real (los sec-ch-* y sec-fetch-* son clave si toca caer
+# al backend "requests").
 DEFAULT_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/126.0.0.0 Safari/537.36"
     ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept": (
+        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+        "application/signed-exchange;v=b3;q=0.7"
+    ),
     "Accept-Language": "en-US,en;q=0.9",
     "Accept-Encoding": "gzip, deflate, br",
     "Connection": "keep-alive",
     "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-User": "?1",
+    "Sec-Fetch-Dest": "document",
+    "sec-ch-ua": '"Not/A)Brand";v="8", "Chromium";v="126", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 
@@ -66,9 +101,28 @@ DEFAULT_HEADERS = {
 # Red
 # ---------------------------------------------------------------------------
 
-def fetch_part_page(
-    part_number: str, session: requests.Session, timeout: int = 30
-) -> tuple[str, str]:
+def _new_session():
+    """Crea una sesión HTTP del backend disponible, con headers e impersonate."""
+    if _HTTP_BACKEND == "curl_cffi":
+        # impersonate="chrome" replica TLS + HTTP/2 + headers de Chrome.
+        sess = _http.Session(impersonate="chrome")
+        # curl_cffi ya pone los headers de Chrome al impersonar; añadimos los
+        # nuestros sin pisar los suyos.
+        extra = {k: v for k, v in DEFAULT_HEADERS.items()
+                 if k.lower() not in {"user-agent", "accept",
+                                       "accept-language",
+                                       "accept-encoding",
+                                       "sec-ch-ua",
+                                       "sec-ch-ua-mobile",
+                                       "sec-ch-ua-platform"}}
+        sess.headers.update(extra)
+        return sess
+    sess = _http.Session()
+    sess.headers.update(DEFAULT_HEADERS)
+    return sess
+
+
+def fetch_part_page(part_number: str, session, timeout: int = 30) -> Tuple[str, str]:
     """
     Resuelve un número de parte a su página y devuelve (url_final, html).
 
@@ -86,7 +140,7 @@ def fetch_part_page(
     )
     resp.raise_for_status()
 
-    final_url = resp.url
+    final_url = str(resp.url)
     html = resp.text
 
     if "/part/" in final_url:
@@ -102,21 +156,21 @@ def fetch_part_page(
     part_url = urljoin(BASE_URL, link["href"])
     resp = session.get(part_url, timeout=timeout, allow_redirects=True)
     resp.raise_for_status()
-    return resp.url, resp.text
+    return str(resp.url), resp.text
 
 
 # ---------------------------------------------------------------------------
 # Parser
 # ---------------------------------------------------------------------------
 
-def _collect_cross_refs(h3) -> list[str]:
+def _collect_cross_refs(h3) -> list:
     """Toma un <h3> y devuelve los part numbers del grid hermano siguiente."""
     if not h3:
         return []
     grid = h3.find_next_sibling("div")
     if not grid:
         return []
-    items: list[str] = []
+    items = []
     for d in grid.find_all("div", attrs={"wire:key": re.compile(r"cross-reference")}):
         text = d.get_text(strip=True)
         if text:
@@ -145,7 +199,7 @@ def parse_part_page(html: str) -> dict:
     if soup.title:
         result["title"] = soup.title.get_text(strip=True)
 
-    # Datos estructurados JSON-LD (forma más fiable de obtener mpn/nombre/precio)
+    # Datos estructurados JSON-LD (mpn / nombre / precio)
     ld = soup.find("script", {"type": "application/ld+json"})
     if ld and ld.string:
         try:
@@ -165,7 +219,7 @@ def parse_part_page(html: str) -> dict:
         except (json.JSONDecodeError, AttributeError):
             pass
 
-    # Fallback al <h1> si el JSON-LD no estaba
+    # Fallback al <h1>
     if not result["current_part_number"]:
         h1 = soup.find("h1")
         if h1:
@@ -176,8 +230,6 @@ def parse_part_page(html: str) -> dict:
                 result["name"] = h1.get_text(" ", strip=True)
 
     # ---- "Replaces" (reemplazo directo) ----
-    # <h4 class="...">Replaces</h4>
-    # <div class="..."><strong>W10476828</strong> – part you searched</div>
     replaces_h4 = soup.find(
         "h4", string=re.compile(r"^\s*Replaces\s*$", re.IGNORECASE)
     )
@@ -190,15 +242,16 @@ def parse_part_page(html: str) -> dict:
                     result["replaces"].append(num)
 
     # ---- "Also Replaces": fabricante + SKUs/competidores ----
-    # Solo consideramos h3s que tengan un grid hermano con divs de
-    # cross-reference (esto descarta encabezados de sección como
-    # "Alternate Part Numbers").
+    # Solo h3s que tengan un grid hermano con cross-references (descarta
+    # encabezados decorativos como "Alternate Part Numbers").
     h3_mfr = None
     h3_skus = None
     for h3 in soup.find_all("h3"):
         text = h3.get_text(strip=True)
         sib = h3.find_next_sibling("div")
-        if not sib or not sib.find("div", attrs={"wire:key": re.compile(r"cross-reference")}):
+        if not sib or not sib.find(
+            "div", attrs={"wire:key": re.compile(r"cross-reference")}
+        ):
             continue
         if re.search(r"SKUs.*competitor.*part numbers", text, re.IGNORECASE):
             h3_skus = h3
@@ -299,12 +352,27 @@ def main() -> None:
     parser.add_argument(
         "--timeout", type=int, default=30, help="Timeout HTTP en segundos (default 30)"
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Imprime info de diagnóstico (backend HTTP, etc.)",
+    )
     args = parser.parse_args()
 
     if not args.part_number and not args.file:
         parser.error("Debes proveer un número de parte o usar --file ARCHIVO.html")
 
-    # Modo offline (parsear archivo local)
+    if args.debug and not args.file:
+        print(f"[debug] HTTP backend: {_HTTP_BACKEND}", file=sys.stderr)
+        if _HTTP_BACKEND == "requests":
+            print(
+                "[debug] Aviso: 'requests' suele ser bloqueado por Cloudflare con 403.\n"
+                "[debug] Instala curl_cffi para imitar TLS de Chrome:\n"
+                "[debug]     pip install curl_cffi",
+                file=sys.stderr,
+            )
+
+    # Modo offline
     if args.file:
         with open(args.file, "r", encoding="utf-8", errors="replace") as f:
             html = f.read()
@@ -312,21 +380,24 @@ def main() -> None:
         data["source_url"] = f"file://{args.file}"
         data["queried_part_number"] = args.part_number
     else:
-        session = requests.Session()
-        session.headers.update(DEFAULT_HEADERS)
+        session = _new_session()
         try:
             url, html = fetch_part_page(
                 args.part_number, session, timeout=args.timeout
             )
-        except requests.HTTPError as e:
-            print(f"Error HTTP: {e}", file=sys.stderr)
-            sys.exit(1)
-        except requests.RequestException as e:
-            print(f"Error de red: {e}", file=sys.stderr)
-            sys.exit(2)
-        except RuntimeError as e:
+        except Exception as e:  # cubre HTTPError de ambos backends
+            msg = str(e)
+            if "403" in msg:
+                print(
+                    f"Error HTTP 403 (bloqueado por Cloudflare): {e}\n"
+                    f"  Backend actual: {_HTTP_BACKEND}\n"
+                    f"  Sugerencia: instala curl_cffi para imitar TLS de Chrome:\n"
+                    f"      pip install curl_cffi",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
             print(f"Error: {e}", file=sys.stderr)
-            sys.exit(3)
+            sys.exit(2)
 
         if args.save_html:
             with open(args.save_html, "w", encoding="utf-8") as f:
