@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus
 
+from playwright_stealth import stealth_sync
+
 try:
     from bs4 import BeautifulSoup, Tag
 except ImportError:
@@ -90,38 +92,40 @@ class PartsDrBrowser:
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
+                # Añadimos estas flags para parecer más un navegador real
+                "--disable-infobars",
+                "--window-position=0,0",
             ],
         )
+        # Usamos un contexto más robusto
         context = self._browser.new_context(
             user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 900},
-            locale="en-US",
+            viewport={"width": 1920, "height": 1080},
+            device_scale_factor=1,
         )
-        # Pequeño parche: muchas detecciones miran navigator.webdriver
-        context.add_init_script(
-            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
-        )
+        
         self.page = context.new_page()
+        
+        # APLICAR STEALTH AQUÍ
+        stealth_sync(self.page)
+        
         self.page.set_default_timeout(self.timeout_ms)
         return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        try:
-            if self._browser:
-                self._browser.close()
-        finally:
-            if self._pw:
-                self._pw.stop()
-
     def goto(self, url: str) -> str:
-        """Navega y devuelve el HTML renderizado."""
+        """Navega con pausas para evitar detección."""
         assert self.page is not None
-        self.page.goto(url, wait_until="domcontentloaded")
-        # Damos un respiro a contenidos hidratados por JS
-        try:
-            self.page.wait_for_load_state("networkidle", timeout=8_000)
-        except PlaywrightTimeoutError:
-            pass
+        
+        # Pequeña espera aleatoria antes de navegar
+        time.sleep(2) 
+        
+        self.page.goto(url, wait_until="networkidle")
+        
+        # Si ves el "Just a moment", esperamos un poco más para que cargue
+        if "Just a moment" in self.page.content():
+            print("[!] Cloudflare detectado, esperando 5 segundos extra...", file=sys.stderr)
+            time.sleep(5)
+            
         return self.page.content()
 
     def screenshot(self, path: str) -> None:
