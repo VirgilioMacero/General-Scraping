@@ -1,12 +1,1 @@
-(test) PS C:\Users\virgi\Documents\General-Scraping> py .\PartsDR_Scraper.py WPW10511278 --headed
-Traceback (most recent call last):
-  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 159, in <module>
-    main()
-    ~~~~^^
-  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 148, in main
-    with PartsDrBrowser(headed=args.headed) as browser:
-         ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^
-  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 57, in __enter__
-    playwright_stealth.stealth(self.page)
-    ~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^
-TypeError: 'module' object is not callable
+Error HTTP: 403 Client Error: Forbidden for url: https://partsdr.com/search?query=WPW10476828
