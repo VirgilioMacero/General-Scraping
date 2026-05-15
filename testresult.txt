@@ -1,0 +1,43 @@
+(test) PS C:\Users\virgi\Documents\General-Scraping> python3 .\PartsDR_Scraper.py WB27K10090
+Traceback (most recent call last):
+  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 434, in <module>
+    raise SystemExit(main())
+                     ~~~~^^
+  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 384, in main
+    with PartsDrBrowser(headed=args.headed, timeout_ms=args.timeout * 1000) as browser:
+         ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 87, in __enter__
+    self._pw = sync_playwright().start()
+               ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\virgi\Documents\General-Scraping\test\Lib\site-packages\playwright\sync_api\_context_manager.py", line 84, in start
+    return self.__enter__()
+           ~~~~~~~~~~~~~~^^
+  File "C:\Users\virgi\Documents\General-Scraping\test\Lib\site-packages\playwright\sync_api\_context_manager.py", line 77, in __enter__
+    dispatcher_fiber.switch()
+    ~~~~~~~~~~~~~~~~~~~~~~~^^
+  File "C:\Users\virgi\Documents\General-Scraping\test\Lib\site-packages\playwright\sync_api\_context_manager.py", line 56, in greenlet_main
+    self._loop.run_until_complete(self._connection.run_as_sync())
+    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\base_events.py", line 706, in run_until_complete
+    self.run_forever()
+    ~~~~~~~~~~~~~~~~^^
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\base_events.py", line 677, in run_forever
+    self._run_once()
+    ~~~~~~~~~~~~~~^^
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\base_events.py", line 2019, in _run_once
+    event_list = self._selector.select(timeout)
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\windows_events.py", line 446, in select
+    self._poll(timeout)
+    ~~~~~~~~~~^^^^^^^^^
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\windows_events.py", line 775, in _poll
+    status = _overlapped.GetQueuedCompletionStatus(self._iocp, ms)
+KeyboardInterrupt
+Task was destroyed but it is pending!
+task: <Task pending name='Task-3' coro=<Connection.run.<locals>.init() running at C:\Users\virgi\Documents\General-Scraping\test\Lib\site-packages\playwright\_impl\_connection.py:310> wait_for=<Future pending cb=[Task.task_wakeup()]> cb=[ProtocolCallback.__init__.<locals>.cb() at C:\Users\virgi\Documents\General-Scraping\test\Lib\site-packages\playwright\_impl\_connection.py:230]>
+Exception ignored while calling deallocator <function BaseSubprocessTransport.__del__ at 0x0000018D5749B690>:
+Traceback (most recent call last):
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\base_subprocess.py", line 135, in __del__
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\base_subprocess.py", line 74, in __repr__
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\proactor_events.py", line 80, in __repr__
+  File "C:\Users\virgi\AppData\Local\Python\pythoncore-3.14-64\Lib\asyncio\windows_utils.py", line 109, in fileno
+ValueError: I/O operation on closed pipe
