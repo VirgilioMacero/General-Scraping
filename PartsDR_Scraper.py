@@ -37,8 +37,7 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 from urllib.parse import quote_plus
-
-from playwright_stealth import stealth_sync
+from playwright_stealth import stealth
 
 try:
     from bs4 import BeautifulSoup, Tag
@@ -107,7 +106,7 @@ class PartsDrBrowser:
         self.page = context.new_page()
         
         # APLICAR STEALTH AQUÍ
-        stealth_sync(self.page)
+        stealth(self.page)
         
         self.page.set_default_timeout(self.timeout_ms)
         return self
