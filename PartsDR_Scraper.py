@@ -1,158 +1,346 @@
 #!/usr/bin/env python3
+"""
+PartsDR "Replaces" scraper
+==========================
+
+Dado un número de parte (ej. WPW10476828), busca el producto en partsdr.com
+y devuelve los números a los que reemplaza:
+
+  - Replaces                          (reemplazo directo / legacy)
+  - <Brand> part numbers              (números cruzados del fabricante)
+  - SKUs and competitor part numbers  (SKUs y competidores)
+
+Uso:
+    python3 partsdr_replaces.py WPW10476828
+    python3 partsdr_replaces.py WPW10476828 --json
+    python3 partsdr_replaces.py WPW10476828 --json > out.json
+    python3 partsdr_replaces.py WPW10476828 --save-html debug.html
+    python3 partsdr_replaces.py --file ruta/al/archivo.html         (parsea sin red)
+
+Dependencias:
+    pip install requests beautifulsoup4
+"""
+
+from __future__ import annotations
+
 import argparse
-import csv
-import io
 import json
 import re
 import sys
-import time
-from pathlib import Path
-from typing import Dict, List, Optional
-from urllib.parse import quote_plus
-
-# 1. IMPORTACIÓN CORREGIDA
-from playwright_stealth import stealth as apply_stealth
-try:
-    from bs4 import BeautifulSoup, Tag
-except ImportError:
-    sys.exit("Falta beautifulsoup4. Ejecuta: pip install beautifulsoup4 lxml")
+from typing import Optional
+from urllib.parse import urljoin
 
 try:
-    from playwright.sync_api import (
-        Browser,
-        Page,
-        Playwright,
-        TimeoutError as PlaywrightTimeoutError,
-        sync_playwright,
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError as e:
+    print(
+        "Falta una dependencia. Instala con:\n"
+        "    pip install requests beautifulsoup4\n"
+        f"(detalle: {e})",
+        file=sys.stderr,
     )
-except ImportError:
-    sys.exit("Falta playwright. Ejecuta: pip install playwright && playwright install chromium")
+    sys.exit(127)
+
 
 BASE_URL = "https://partsdr.com"
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-PART_TOKEN_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-\/\.]{3,}$")
+SEARCH_URL = f"{BASE_URL}/search"
 
-class PartsDrBrowser:
-    def __init__(self, headed: bool = False, timeout_ms: int = 30_000) -> None:
-        self.headed = headed
-        self.timeout_ms = timeout_ms
-        self._pw = None
-        self._browser = None
-        self.page = None
+# User-Agent realista. Como vas a correrlo desde una IP residencial, basta
+# con un UA estándar de navegador.
+DEFAULT_HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/126.0.0.0 Safari/537.36"
+    ),
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+}
 
-    def __enter__(self) -> "PartsDrBrowser":
-        self._pw = sync_playwright().start()
-        self._browser = self._pw.chromium.launch(
-            headless=not self.headed,
-            args=["--disable-blink-features=AutomationControlled", "--no-sandbox"],
+
+# ---------------------------------------------------------------------------
+# Red
+# ---------------------------------------------------------------------------
+
+def fetch_part_page(
+    part_number: str, session: requests.Session, timeout: int = 30
+) -> tuple[str, str]:
+    """
+    Resuelve un número de parte a su página y devuelve (url_final, html).
+
+    Estrategia:
+      1) /search?query=<part> normalmente redirige a /part/<slug> cuando
+         hay coincidencia exacta. Seguimos los redirects.
+      2) Si en cambio aterriza en una página de resultados, tomamos el
+         primer enlace que apunta a /part/.
+    """
+    resp = session.get(
+        SEARCH_URL,
+        params={"query": part_number},
+        timeout=timeout,
+        allow_redirects=True,
+    )
+    resp.raise_for_status()
+
+    final_url = resp.url
+    html = resp.text
+
+    if "/part/" in final_url:
+        return final_url, html
+
+    soup = BeautifulSoup(html, "html.parser")
+    link = soup.select_one('a[href*="/part/"]')
+    if not link:
+        raise RuntimeError(
+            f"No se encontró ninguna página de producto para '{part_number}'."
         )
-        context = self._browser.new_context(
-            user_agent=USER_AGENT,
-            viewport={"width": 1366, "height": 900},
-        )
-        self.page = context.new_page()
-        
-        # 2. LLAMADA CORREGIDA (Módulo.Función)
-        apply_stealth(self.page)
-        
-        self.page.set_default_timeout(self.timeout_ms)
-        return self
 
-    def __exit__(self, exc_type, exc, tb) -> None:
-        try:
-            if self._browser: self._browser.close()
-        finally:
-            if self._pw: self._pw.stop()
+    part_url = urljoin(BASE_URL, link["href"])
+    resp = session.get(part_url, timeout=timeout, allow_redirects=True)
+    resp.raise_for_status()
+    return resp.url, resp.text
 
-    def goto(self, url: str) -> str:
-        assert self.page is not None
-        time.sleep(2) # Pausa humana
-        self.page.goto(url, wait_until="domcontentloaded")
-        
-        # Espera extra si aparece el bloqueo de Cloudflare
-        if "Just a moment" in self.page.content():
-            print("[i] Esperando a Cloudflare...", file=sys.stderr)
-            time.sleep(6)
-            
+
+# ---------------------------------------------------------------------------
+# Parser
+# ---------------------------------------------------------------------------
+
+def _collect_cross_refs(h3) -> list[str]:
+    """Toma un <h3> y devuelve los part numbers del grid hermano siguiente."""
+    if not h3:
+        return []
+    grid = h3.find_next_sibling("div")
+    if not grid:
+        return []
+    items: list[str] = []
+    for d in grid.find_all("div", attrs={"wire:key": re.compile(r"cross-reference")}):
+        text = d.get_text(strip=True)
+        if text:
+            items.append(text)
+    return items
+
+
+def parse_part_page(html: str) -> dict:
+    soup = BeautifulSoup(html, "html.parser")
+
+    result: dict = {
+        "title": None,
+        "current_part_number": None,
+        "name": None,
+        "manufacturer": None,
+        "price": None,
+        "replaces": [],
+        "also_replaces": {
+            "manufacturer_label": None,
+            "manufacturer_part_numbers": [],
+            "skus_and_competitor_part_numbers": [],
+        },
+    }
+
+    # <title>
+    if soup.title:
+        result["title"] = soup.title.get_text(strip=True)
+
+    # Datos estructurados JSON-LD (forma más fiable de obtener mpn/nombre/precio)
+    ld = soup.find("script", {"type": "application/ld+json"})
+    if ld and ld.string:
         try:
-            self.page.wait_for_load_state("networkidle", timeout=10_000)
-        except:
+            data = json.loads(ld.string)
+            result["current_part_number"] = data.get("mpn")
+            result["name"] = data.get("name")
+            brand = data.get("brand") or {}
+            result["manufacturer"] = brand.get("name")
+            offers = data.get("offers") or {}
+            if offers.get("price") is not None:
+                avail = offers.get("availability", "")
+                result["price"] = {
+                    "amount": offers.get("price"),
+                    "currency": offers.get("priceCurrency"),
+                    "availability": avail.rsplit("/", 1)[-1] if avail else None,
+                }
+        except (json.JSONDecodeError, AttributeError):
             pass
-        return self.page.content()
 
-    def screenshot(self, path: str) -> None:
-        if self.page: self.page.screenshot(path=path, full_page=True)
+    # Fallback al <h1> si el JSON-LD no estaba
+    if not result["current_part_number"]:
+        h1 = soup.find("h1")
+        if h1:
+            span = h1.find("span")
+            if span:
+                result["current_part_number"] = span.get_text(strip=True)
+            if not result["name"]:
+                result["name"] = h1.get_text(" ", strip=True)
 
-# --- Funciones de resolución y parseo ---
+    # ---- "Replaces" (reemplazo directo) ----
+    # <h4 class="...">Replaces</h4>
+    # <div class="..."><strong>W10476828</strong> – part you searched</div>
+    replaces_h4 = soup.find(
+        "h4", string=re.compile(r"^\s*Replaces\s*$", re.IGNORECASE)
+    )
+    if replaces_h4:
+        nxt = replaces_h4.find_next_sibling("div")
+        if nxt:
+            for strong in nxt.find_all("strong"):
+                num = strong.get_text(strip=True)
+                if num:
+                    result["replaces"].append(num)
 
-def resolve_part_url(browser: PartsDrBrowser, query: str) -> str:
-    if query.startswith("http"): return query
-    search_url = f"{BASE_URL}/search?q={quote_plus(query)}"
-    html = browser.goto(search_url)
-    if "/part/" in browser.page.url:
-        return browser.page.url.split("?")[0]
-    soup = BeautifulSoup(html, "lxml")
-    for a in soup.select("a[href*='/part/']"):
-        href = a.get("href", "")
-        if href.startswith("/"): href = BASE_URL + href
-        return href.split("?")[0]
-    raise RuntimeError(f"No se encontró producto para '{query}'")
+    # ---- "Also Replaces": fabricante + SKUs/competidores ----
+    # Solo consideramos h3s que tengan un grid hermano con divs de
+    # cross-reference (esto descarta encabezados de sección como
+    # "Alternate Part Numbers").
+    h3_mfr = None
+    h3_skus = None
+    for h3 in soup.find_all("h3"):
+        text = h3.get_text(strip=True)
+        sib = h3.find_next_sibling("div")
+        if not sib or not sib.find("div", attrs={"wire:key": re.compile(r"cross-reference")}):
+            continue
+        if re.search(r"SKUs.*competitor.*part numbers", text, re.IGNORECASE):
+            h3_skus = h3
+        elif re.search(r"\bpart numbers\b", text, re.IGNORECASE) and h3_mfr is None:
+            h3_mfr = h3
 
-def _looks_like_part_number(text: str) -> bool:
-    t = text.strip().upper()
-    return bool(t and " " not in t and 4 <= len(t) <= 30 and any(c.isdigit() for c in t) and PART_TOKEN_RE.match(t))
+    if h3_mfr is not None:
+        result["also_replaces"]["manufacturer_part_numbers"] = _collect_cross_refs(h3_mfr)
+        m = re.match(
+            r"^(.+?)\s+part numbers", h3_mfr.get_text(strip=True), re.IGNORECASE
+        )
+        if m:
+            result["also_replaces"]["manufacturer_label"] = m.group(1)
 
-def _collect_tokens_after(node: Tag) -> List[str]:
-    tokens = []
-    for sib in node.find_next_siblings():
-        if sib.name in ("h1", "h2", "h3", "h4"): break
-        for el in sib.find_all(["li", "span", "a", "td", "p", "div"]):
-            for piece in re.split(r"[,\s/|·•]+", el.get_text(" ", strip=True)):
-                if _looks_like_part_number(piece): tokens.append(piece.upper())
-    return list(dict.fromkeys(tokens))
+    result["also_replaces"]["skus_and_competitor_part_numbers"] = _collect_cross_refs(h3_skus)
 
-def parse_replaces(html: str) -> Dict[str, object]:
-    soup = BeautifulSoup(html, "lxml")
-    result = {"page_title": soup.title.text if soup.title else "", "brand_part_numbers": {}, "skus_and_competitor_numbers": [], "part_production_numbers": []}
-    for h in soup.find_all(re.compile(r"^h[1-6]$")):
-        label = h.get_text(" ", strip=True).lower()
-        if "part numbers" in label and "sku" not in label and "production" not in label:
-            brand = label.replace("part numbers", "").replace("part number", "").strip().title()
-            result["brand_part_numbers"][brand] = _collect_tokens_after(h)
-        elif "sku" in label and "competitor" in label:
-            result["skus_and_competitor_numbers"].extend(_collect_tokens_after(h))
-        elif "production number" in label:
-            result["part_production_numbers"].extend(_collect_tokens_after(h))
-    
-    if not any([result["brand_part_numbers"], result["skus_and_competitor_numbers"], result["part_production_numbers"]]):
-        result["_warning"] = "No se detectaron secciones. Posible cambio de estructura."
-        result["raw_candidates"] = sorted({t for t in re.split(r"\s+", soup.get_text()) if _looks_like_part_number(t)})
     return result
 
-def format_text(data: Dict[str, object]) -> str:
-    out = [f"# {data.get('page_title')}\n"]
-    for brand, nums in data.get("brand_part_numbers", {}).items():
-        out.append(f"{brand} part numbers:\n" + "\n".join(nums) + "\n")
-    if data.get("skus_and_competitor_numbers"):
-        out.append("SKUs and competitor numbers:\n" + "\n".join(data["skus_and_competitor_numbers"]) + "\n")
-    if data.get("_warning"): out.append(f"WARN: {data['_warning']}")
-    return "\n".join(out)
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("query", help="Part number o URL")
-    parser.add_argument("--headed", action="store_true")
+# ---------------------------------------------------------------------------
+# Salida
+# ---------------------------------------------------------------------------
+
+def print_pretty(data: dict) -> None:
+    print()
+    title = data.get("name") or data.get("title") or "(parte desconocida)"
+    bar = "=" * max(60, min(len(title) + 4, 80))
+    print(bar)
+    print(f"  {title}")
+    print(bar)
+
+    if data.get("current_part_number"):
+        print(f"Número de parte : {data['current_part_number']}")
+    if data.get("manufacturer"):
+        print(f"Fabricante      : {data['manufacturer']}")
+    if data.get("price"):
+        p = data["price"]
+        avail = p.get("availability") or ""
+        print(f"Precio          : {p.get('amount')} {p.get('currency')} ({avail})")
+    if data.get("source_url"):
+        print(f"Fuente          : {data['source_url']}")
+    print()
+
+    if data["replaces"]:
+        print(f"Replaces ({len(data['replaces'])}):")
+        for r in data["replaces"]:
+            print(f"  • {r}")
+    else:
+        print("Replaces: (ninguno listado)")
+    print()
+
+    ar = data["also_replaces"]
+    label = ar.get("manufacturer_label") or "Manufacturer"
+    if ar["manufacturer_part_numbers"]:
+        print(f"{label} part numbers ({len(ar['manufacturer_part_numbers'])}):")
+        for n in ar["manufacturer_part_numbers"]:
+            print(f"  • {n}")
+        print()
+
+    if ar["skus_and_competitor_part_numbers"]:
+        print(
+            f"SKUs and competitor part numbers "
+            f"({len(ar['skus_and_competitor_part_numbers'])}):"
+        )
+        for n in ar["skus_and_competitor_part_numbers"]:
+            print(f"  • {n}")
+        print()
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Obtiene los 'Replaces' de una parte desde partsdr.com",
+    )
+    parser.add_argument(
+        "part_number",
+        nargs="?",
+        help="Número de parte a consultar, p. ej. WPW10476828",
+    )
+    parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Salida en JSON (útil para scripting)",
+    )
+    parser.add_argument(
+        "--save-html",
+        metavar="FILE",
+        help="Guarda el HTML descargado en este archivo (debug)",
+    )
+    parser.add_argument(
+        "--file",
+        metavar="HTML",
+        help="No hace request, parsea un archivo HTML local (modo offline / debug)",
+    )
+    parser.add_argument(
+        "--timeout", type=int, default=30, help="Timeout HTTP en segundos (default 30)"
+    )
     args = parser.parse_args()
 
-    with PartsDrBrowser(headed=args.headed) as browser:
+    if not args.part_number and not args.file:
+        parser.error("Debes proveer un número de parte o usar --file ARCHIVO.html")
+
+    # Modo offline (parsear archivo local)
+    if args.file:
+        with open(args.file, "r", encoding="utf-8", errors="replace") as f:
+            html = f.read()
+        data = parse_part_page(html)
+        data["source_url"] = f"file://{args.file}"
+        data["queried_part_number"] = args.part_number
+    else:
+        session = requests.Session()
+        session.headers.update(DEFAULT_HEADERS)
         try:
-            url = resolve_part_url(browser, args.query)
-            print(f"[i] Analizando: {url}")
-            html = browser.goto(url)
-            data = parse_replaces(html)
-            print(format_text(data))
-        except Exception as e:
-            print(f"[!] Error: {e}")
+            url, html = fetch_part_page(
+                args.part_number, session, timeout=args.timeout
+            )
+        except requests.HTTPError as e:
+            print(f"Error HTTP: {e}", file=sys.stderr)
+            sys.exit(1)
+        except requests.RequestException as e:
+            print(f"Error de red: {e}", file=sys.stderr)
+            sys.exit(2)
+        except RuntimeError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(3)
+
+        if args.save_html:
+            with open(args.save_html, "w", encoding="utf-8") as f:
+                f.write(html)
+
+        data = parse_part_page(html)
+        data["source_url"] = url
+        data["queried_part_number"] = args.part_number
+
+    if args.json:
+        print(json.dumps(data, indent=2, ensure_ascii=False))
+    else:
+        print_pretty(data)
+
 
 if __name__ == "__main__":
     main()
