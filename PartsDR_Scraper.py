@@ -75,14 +75,12 @@ PART_TOKEN_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-\/\.]{3,}$")
 # --------------------------- Playwright helpers --------------------------- #
 
 class PartsDrBrowser:
-    """Context manager para reutilizar el browser entre múltiples fetches."""
-
     def __init__(self, headed: bool = False, timeout_ms: int = 30_000) -> None:
         self.headed = headed
         self.timeout_ms = timeout_ms
-        self._pw: Optional[Playwright] = None
-        self._browser: Optional[Browser] = None
-        self.page: Optional[Page] = None
+        self._pw = None
+        self._browser = None
+        self.page = None
 
     def __enter__(self) -> "PartsDrBrowser":
         self._pw = sync_playwright().start()
@@ -91,46 +89,44 @@ class PartsDrBrowser:
             args=[
                 "--disable-blink-features=AutomationControlled",
                 "--no-sandbox",
-                # Añadimos estas flags para parecer más un navegador real
-                "--disable-infobars",
-                "--window-position=0,0",
             ],
         )
-        # Usamos un contexto más robusto
         context = self._browser.new_context(
             user_agent=USER_AGENT,
-            viewport={"width": 1920, "height": 1080},
-            device_scale_factor=1,
+            viewport={"width": 1366, "height": 900},
         )
-        
         self.page = context.new_page()
         
-        # APLICAR STEALTH AQUÍ
+        # Aquí es donde aplicas el stealth que instalamos
+        from playwright_stealth import stealth
         stealth(self.page)
         
         self.page.set_default_timeout(self.timeout_ms)
         return self
 
+    # ASEGÚRATE DE QUE ESTO ESTÉ PRESENTE Y BIEN IDENTADO
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if self._browser:
+                self._browser.close()
+        finally:
+            if self._pw:
+                self._pw.stop()
+
     def goto(self, url: str) -> str:
-        """Navega con pausas para evitar detección."""
         assert self.page is not None
-        
-        # Pequeña espera aleatoria antes de navegar
-        time.sleep(2) 
-        
-        self.page.goto(url, wait_until="networkidle")
-        
-        # Si ves el "Just a moment", esperamos un poco más para que cargue
-        if "Just a moment" in self.page.content():
-            print("[!] Cloudflare detectado, esperando 5 segundos extra...", file=sys.stderr)
-            time.sleep(5)
-            
+        # Espera un poco para parecer humano
+        time.sleep(1)
+        self.page.goto(url, wait_until="domcontentloaded")
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=8_000)
+        except:
+            pass
         return self.page.content()
 
     def screenshot(self, path: str) -> None:
         assert self.page is not None
         self.page.screenshot(path=path, full_page=True)
-
 
 # --------------------------- URL Resolution ------------------------------- #
 
