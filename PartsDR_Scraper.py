@@ -1,131 +1,155 @@
 #!/usr/bin/env python3
 """
-PartsDR Replaces Scraper
-========================
+PartsDR Replaces Scraper (Playwright)
+=====================================
 Extrae la sección "Replaces" de una página de parte en partsdr.com:
   - Brand part numbers (GE, Samsung, Whirlpool, etc.)
   - SKUs and competitor part numbers
   - Part production numbers
 
+Usa Playwright + Chromium para renderizar JS y evadir bloqueos anti-bot (403/Cloudflare).
+
+Instalación:
+    pip install playwright beautifulsoup4 lxml
+    playwright install chromium
+
 Uso:
     python partsdr_scraper.py WB27K10090
-    python partsdr_scraper.py https://partsdr.com/part/wb27k10090-some-slug
+    python partsdr_scraper.py https://partsdr.com/part/wd35x35958-hardware-kit
     python partsdr_scraper.py WB27K10090 --format json
     python partsdr_scraper.py WB27K10090 --format json --output out.json
-    python partsdr_scraper.py WB27K10090 --use-cloudscraper   # si recibes 403
+    python partsdr_scraper.py WB27K10090 --headed        # ver el navegador
+    python partsdr_scraper.py WB27K10090 --screenshot debug.png
 
-Requisitos:
-    pip install requests beautifulsoup4 lxml
-    # Opcional (para evadir Cloudflare):
-    pip install cloudscraper
+    # Procesar varios part numbers desde un archivo (uno por línea):
+    python partsdr_scraper.py --batch parts.txt --format csv --output all.csv
 """
 
 from __future__ import annotations
 
 import argparse
+import csv
+import io
 import json
 import re
 import sys
 import time
+from pathlib import Path
 from typing import Dict, List, Optional
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus
 
 try:
-    import requests
     from bs4 import BeautifulSoup, Tag
 except ImportError:
-    sys.exit("Faltan dependencias. Ejecuta: pip install requests beautifulsoup4 lxml")
+    sys.exit("Falta beautifulsoup4. Ejecuta: pip install beautifulsoup4 lxml")
+
+try:
+    from playwright.sync_api import (
+        Browser,
+        Page,
+        Playwright,
+        TimeoutError as PlaywrightTimeoutError,
+        sync_playwright,
+    )
+except ImportError:
+    sys.exit(
+        "Falta playwright. Ejecuta:\n"
+        "    pip install playwright\n"
+        "    playwright install chromium"
+    )
 
 
 BASE_URL = "https://partsdr.com"
 
-# Headers de un navegador real para evitar respuestas 403.
-DEFAULT_HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": (
-        "text/html,application/xhtml+xml,application/xml;q=0.9,"
-        "image/avif,image/webp,*/*;q=0.8"
-    ),
-    "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
-    "Upgrade-Insecure-Requests": "1",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Sec-Fetch-User": "?1",
-    "Cache-Control": "max-age=0",
-}
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
-# Heurística para detectar algo que se ve como número de parte.
-# Acepta tokens alfanuméricos con al menos 4 caracteres y al menos un dígito.
+# Heurística para validar tokens que parecen número de parte.
 PART_TOKEN_RE = re.compile(r"^[A-Z0-9][A-Z0-9\-\/\.]{3,}$")
 
 
-# ----------------------------- HTTP --------------------------------------- #
+# --------------------------- Playwright helpers --------------------------- #
 
-def build_session(use_cloudscraper: bool = False):
-    """Construye una sesión HTTP. Usa cloudscraper si está disponible y se pide."""
-    if use_cloudscraper:
-        try:
-            import cloudscraper  # type: ignore
-            scraper = cloudscraper.create_scraper(
-                browser={"browser": "chrome", "platform": "windows", "mobile": False}
-            )
-            scraper.headers.update(DEFAULT_HEADERS)
-            return scraper
-        except ImportError:
-            print(
-                "[!] cloudscraper no está instalado. Continuando con requests. "
-                "Instala con: pip install cloudscraper",
-                file=sys.stderr,
-            )
-    session = requests.Session()
-    session.headers.update(DEFAULT_HEADERS)
-    return session
+class PartsDrBrowser:
+    """Context manager para reutilizar el browser entre múltiples fetches."""
 
+    def __init__(self, headed: bool = False, timeout_ms: int = 30_000) -> None:
+        self.headed = headed
+        self.timeout_ms = timeout_ms
+        self._pw: Optional[Playwright] = None
+        self._browser: Optional[Browser] = None
+        self.page: Optional[Page] = None
 
-def fetch(session, url: str, timeout: int = 30) -> str:
-    """Descarga una URL y devuelve HTML, lanzando una excepción legible si falla."""
-    response = session.get(url, timeout=timeout)
-    if response.status_code == 403:
-        raise RuntimeError(
-            f"HTTP 403 en {url}. El sitio detectó al bot. "
-            "Vuelve a intentar con --use-cloudscraper o usa Playwright."
+    def __enter__(self) -> "PartsDrBrowser":
+        self._pw = sync_playwright().start()
+        self._browser = self._pw.chromium.launch(
+            headless=not self.headed,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+            ],
         )
-    response.raise_for_status()
-    return response.text
+        context = self._browser.new_context(
+            user_agent=USER_AGENT,
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+        )
+        # Pequeño parche: muchas detecciones miran navigator.webdriver
+        context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+        )
+        self.page = context.new_page()
+        self.page.set_default_timeout(self.timeout_ms)
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        try:
+            if self._browser:
+                self._browser.close()
+        finally:
+            if self._pw:
+                self._pw.stop()
+
+    def goto(self, url: str) -> str:
+        """Navega y devuelve el HTML renderizado."""
+        assert self.page is not None
+        self.page.goto(url, wait_until="domcontentloaded")
+        # Damos un respiro a contenidos hidratados por JS
+        try:
+            self.page.wait_for_load_state("networkidle", timeout=8_000)
+        except PlaywrightTimeoutError:
+            pass
+        return self.page.content()
+
+    def screenshot(self, path: str) -> None:
+        assert self.page is not None
+        self.page.screenshot(path=path, full_page=True)
 
 
 # --------------------------- URL Resolution ------------------------------- #
 
-def resolve_part_url(session, query: str) -> str:
+def resolve_part_url(browser: PartsDrBrowser, query: str) -> str:
     """
-    Si `query` es una URL, la devuelve tal cual.
-    Si es un número de parte, busca en el sitio y resuelve la URL canónica /part/.
+    Si `query` es URL, la devuelve.
+    Si es un part number, navega a la búsqueda y resuelve la URL canónica /part/.
     """
     if query.startswith("http://") or query.startswith("https://"):
         return query
 
-    # Intento directo: el slug puede ser predecible (parte-en-minúsculas-...).
-    # Pero como no siempre coincide, hacemos una búsqueda y seguimos el primer hit.
     search_url = f"{BASE_URL}/search?q={quote_plus(query)}"
-    html = fetch(session, search_url)
+    html = browser.goto(search_url)
+    assert browser.page is not None
+
+    # Si la búsqueda redirige directamente al producto, la URL final ya es /part/
+    final_url = browser.page.url
+    if "/part/" in final_url:
+        return final_url.split("?")[0]
+
+    # Si no, buscamos en el DOM el primer enlace a /part/
     soup = BeautifulSoup(html, "lxml")
-
-    # Caso 1: redirección directa a la página del part — el HTML mismo es la
-    # página del producto. Si encontramos los marcadores de producto, devolvemos.
-    if soup.find(string=re.compile(r"part number", re.I)) and "/part/" in str(
-        soup.find_all("link", rel="canonical"))[:300]:
-        canonical = soup.find("link", rel="canonical")
-        if canonical and canonical.get("href"):
-            return canonical["href"]
-
-    # Caso 2: lista de resultados — agarra el primer enlace que contenga /part/
     for a in soup.select("a[href*='/part/']"):
         href = a.get("href", "")
         if href.startswith("/"):
@@ -133,7 +157,6 @@ def resolve_part_url(session, query: str) -> str:
         if "/part/" in href:
             return href.split("?")[0]
 
-    # Último recurso: probar URL adivinada
     raise RuntimeError(
         f"No se encontró URL de producto para '{query}'. "
         f"Intenta pasando la URL completa de partsdr.com directamente."
@@ -143,7 +166,6 @@ def resolve_part_url(session, query: str) -> str:
 # ------------------------ Parsing del HTML -------------------------------- #
 
 def _looks_like_part_number(text: str) -> bool:
-    """Filtra ruido. Acepta strings tipo WB27K10090, AP4980366, 1121940066."""
     t = text.strip().upper()
     if not t or " " in t:
         return False
@@ -155,26 +177,19 @@ def _looks_like_part_number(text: str) -> bool:
 
 
 def _collect_tokens_after(node: Tag, stop_headings=("h1", "h2", "h3", "h4")) -> List[str]:
-    """
-    Desde un nodo de encabezado, recolecta tokens tipo número de parte en los
-    siguientes hermanos hasta encontrar otro encabezado del mismo nivel.
-    """
+    """Desde un encabezado, junta tokens tipo número de parte hasta el siguiente encabezado."""
     tokens: List[str] = []
     for sib in node.find_next_siblings():
         if sib.name in stop_headings:
             break
-        # Cada <li>, <span>, <a>, <td>, <p> puede contener un número
         for el in sib.find_all(["li", "span", "a", "td", "p", "div"]):
-            txt = el.get_text(" ", strip=True)
-            # Algunos elementos contienen muchos números separados por coma o /
-            for piece in re.split(r"[,\s/|·•]+", txt):
+            for piece in re.split(r"[,\s/|·•]+", el.get_text(" ", strip=True)):
                 if _looks_like_part_number(piece):
                     tokens.append(piece.upper())
-        # También revisamos el texto plano del propio sibling
         for piece in re.split(r"[,\s/|·•]+", sib.get_text(" ", strip=True)):
             if _looks_like_part_number(piece):
                 tokens.append(piece.upper())
-    # Dedup conservando orden
+
     seen, out = set(), []
     for t in tokens:
         if t not in seen:
@@ -184,31 +199,20 @@ def _collect_tokens_after(node: Tag, stop_headings=("h1", "h2", "h3", "h4")) -> 
 
 
 def parse_replaces(html: str) -> Dict[str, object]:
-    """
-    Recorre el HTML buscando encabezados que coincidan con:
-      - "<Brand> part numbers"
-      - "SKUs and competitor part numbers"
-      - "Part production numbers"
-    y captura los tokens posteriores.
-    """
     soup = BeautifulSoup(html, "lxml")
-
-    # Tomamos el título de la página para tener contexto
     title = soup.title.get_text(strip=True) if soup.title else ""
 
     result: Dict[str, object] = {
         "page_title": title,
-        "brand_part_numbers": {},        # {"GE": [...], "Samsung": [...]}
+        "brand_part_numbers": {},
         "skus_and_competitor_numbers": [],
         "part_production_numbers": [],
     }
 
-    headings = soup.find_all(re.compile(r"^h[1-6]$"))
-    for h in headings:
+    for h in soup.find_all(re.compile(r"^h[1-6]$")):
         label = h.get_text(" ", strip=True)
         lower = label.lower()
 
-        # Brand-specific: "GE part numbers", "Samsung part numbers", etc.
         m = re.match(r"^([\w\.\-& ]+?)\s+part numbers?$", lower)
         if m and "sku" not in lower and "production" not in lower:
             brand = m.group(1).strip().title()
@@ -225,7 +229,6 @@ def parse_replaces(html: str) -> Dict[str, object]:
             result["part_production_numbers"].extend(_collect_tokens_after(h))
             continue
 
-    # Si no detectamos nada por encabezados, fallback: buscar por texto suelto
     if not (
         result["brand_part_numbers"]
         or result["skus_and_competitor_numbers"]
@@ -236,14 +239,14 @@ def parse_replaces(html: str) -> Dict[str, object]:
             "No se detectaron secciones por encabezado. "
             "Inspecciona el HTML manualmente; la estructura puede haber cambiado."
         )
-        # Como último recurso, extrae cualquier token que parezca part number
-        candidates = [t for t in re.split(r"\s+", text) if _looks_like_part_number(t)]
-        result["raw_candidates"] = sorted(set(candidates))
+        result["raw_candidates"] = sorted(
+            {t for t in re.split(r"\s+", text) if _looks_like_part_number(t)}
+        )
 
     return result
 
 
-# ------------------------------ CLI --------------------------------------- #
+# ------------------------------ Output ------------------------------------ #
 
 def format_text(data: Dict[str, object]) -> str:
     out = []
@@ -277,36 +280,54 @@ def format_text(data: Dict[str, object]) -> str:
     return "\n".join(out).rstrip() + "\n"
 
 
-def format_csv(data: Dict[str, object]) -> str:
-    import csv
-    import io
-
-    buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["category", "label", "value"])
+def format_csv_rows(data: Dict[str, object], query: str, writer) -> None:
     for brand, nums in (data.get("brand_part_numbers") or {}).items():
         for n in nums:
-            writer.writerow(["brand_part_number", brand, n])
+            writer.writerow([query, "brand_part_number", brand, n])
     for n in data.get("skus_and_competitor_numbers") or []:
-        writer.writerow(["sku_or_competitor", "", n])
+        writer.writerow([query, "sku_or_competitor", "", n])
     for n in data.get("part_production_numbers") or []:
-        writer.writerow(["production_number", "", n])
-    return buf.getvalue()
+        writer.writerow([query, "production_number", "", n])
+
+
+# ------------------------------ CLI --------------------------------------- #
+
+def scrape_one(
+    browser: PartsDrBrowser,
+    query: str,
+    screenshot: Optional[str] = None,
+) -> Dict[str, object]:
+    url = resolve_part_url(browser, query)
+    print(f"[i] Fetching: {url}", file=sys.stderr)
+    html = browser.goto(url)
+    if screenshot:
+        browser.screenshot(screenshot)
+        print(f"[i] Screenshot: {screenshot}", file=sys.stderr)
+    data = parse_replaces(html)
+    data["source_url"] = url
+    data["query"] = query
+    return data
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Scrapea la sección 'Replaces' de PartsDR."
+        description="Scrapea la sección 'Replaces' de PartsDR con Playwright."
     )
     parser.add_argument(
         "query",
-        help="Número de parte (p. ej. WB27K10090) o URL completa de partsdr.com",
+        nargs="?",
+        help="Número de parte (WB27K10090) o URL completa de partsdr.com",
+    )
+    parser.add_argument(
+        "--batch",
+        metavar="FILE",
+        help="Archivo con un part number/URL por línea para procesar en lote.",
     )
     parser.add_argument(
         "--format",
         choices=["text", "json", "csv"],
         default="text",
-        help="Formato de salida (por defecto: text)",
+        help="Formato de salida (por defecto: text).",
     )
     parser.add_argument(
         "--output",
@@ -314,45 +335,92 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Archivo de salida. Si se omite, escribe a stdout.",
     )
     parser.add_argument(
-        "--use-cloudscraper",
+        "--headed",
         action="store_true",
-        help="Usa cloudscraper para evadir Cloudflare si recibes 403.",
+        help="Muestra el navegador (útil para depurar).",
+    )
+    parser.add_argument(
+        "--screenshot",
+        metavar="PATH",
+        help="Guarda un screenshot de la página final (solo en modo single query).",
+    )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=30,
+        help="Timeout en segundos por petición (por defecto: 30).",
     )
     parser.add_argument(
         "--delay",
         type=float,
-        default=0.0,
-        help="Segundos de espera antes de la petición (sé amable con el sitio).",
+        default=1.0,
+        help="Espera entre peticiones en modo batch (por defecto: 1.0 s).",
     )
 
     args = parser.parse_args(argv)
 
-    session = build_session(use_cloudscraper=args.use_cloudscraper)
+    if not args.query and not args.batch:
+        parser.error("Debes pasar un part number/URL o usar --batch FILE.")
 
-    if args.delay:
-        time.sleep(args.delay)
-
-    try:
-        url = resolve_part_url(session, args.query)
-        print(f"[i] Fetching: {url}", file=sys.stderr)
-        html = fetch(session, url)
-    except Exception as exc:
-        print(f"[!] Error: {exc}", file=sys.stderr)
-        return 1
-
-    data = parse_replaces(html)
-    data["source_url"] = url
-
-    if args.format == "json":
-        rendered = json.dumps(data, indent=2, ensure_ascii=False)
-    elif args.format == "csv":
-        rendered = format_csv(data)
+    queries: List[str]
+    if args.batch:
+        path = Path(args.batch)
+        if not path.exists():
+            print(f"[!] No existe {path}", file=sys.stderr)
+            return 1
+        queries = [
+            ln.strip()
+            for ln in path.read_text(encoding="utf-8").splitlines()
+            if ln.strip() and not ln.strip().startswith("#")
+        ]
+        if not queries:
+            print("[!] El archivo batch está vacío.", file=sys.stderr)
+            return 1
     else:
-        rendered = format_text(data)
+        queries = [args.query]  # type: ignore[list-item]
+
+    results: List[Dict[str, object]] = []
+
+    with PartsDrBrowser(headed=args.headed, timeout_ms=args.timeout * 1000) as browser:
+        for i, q in enumerate(queries):
+            try:
+                data = scrape_one(
+                    browser,
+                    q,
+                    screenshot=args.screenshot if len(queries) == 1 else None,
+                )
+                results.append(data)
+            except Exception as exc:
+                print(f"[!] Error con '{q}': {exc}", file=sys.stderr)
+                results.append({"query": q, "error": str(exc)})
+            if i < len(queries) - 1 and args.delay:
+                time.sleep(args.delay)
+
+    # Render
+    if args.format == "json":
+        payload = results if args.batch else results[0]
+        rendered = json.dumps(payload, indent=2, ensure_ascii=False)
+    elif args.format == "csv":
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(["query", "category", "label", "value"])
+        for data in results:
+            if "error" in data:
+                writer.writerow([data.get("query", ""), "error", "", data["error"]])  # type: ignore[index]
+                continue
+            format_csv_rows(data, str(data.get("query", "")), writer)
+        rendered = buf.getvalue()
+    else:
+        chunks = []
+        for data in results:
+            if "error" in data:
+                chunks.append(f"# {data.get('query', '')}\n[!] {data['error']}\n")
+            else:
+                chunks.append(format_text(data))
+        rendered = "\n".join(chunks)
 
     if args.output:
-        with open(args.output, "w", encoding="utf-8") as f:
-            f.write(rendered)
+        Path(args.output).write_text(rendered, encoding="utf-8")
         print(f"[i] Guardado en {args.output}", file=sys.stderr)
     else:
         sys.stdout.write(rendered)
