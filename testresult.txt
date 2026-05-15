@@ -1,9 +1,12 @@
 (test) PS C:\Users\virgi\Documents\General-Scraping> py .\PartsDR_Scraper.py WPW10511278 --headed
 Traceback (most recent call last):
-  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 437, in <module>
+  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 433, in <module>
     raise SystemExit(main())
                      ~~~~^^
-  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 387, in main
+  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 383, in main
     with PartsDrBrowser(headed=args.headed, timeout_ms=args.timeout * 1000) as browser:
          ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-TypeError: 'PartsDrBrowser' object does not support the context manager protocol (missed __exit__ method)
+  File "C:\Users\virgi\Documents\General-Scraping\PartsDR_Scraper.py", line 102, in __enter__
+    stealth(self.page)
+    ~~~~~~~^^^^^^^^^^^
+TypeError: 'module' object is not callable
